@@ -238,6 +238,86 @@ class SkillRegistry:
 
             self.register(skill_data)
 
+    def load_from_directory(
+        self,
+        directory: str | Path,
+        *,
+        tool_resolver: Callable[[str], BaseTool | None] | None = None,
+    ) -> None:
+        """Load skills from Python modules in a directory (plugin pattern).
+
+        Each Python module in the directory can define a `register(registry)` function
+        that will be called with this registry instance. This enables progressive
+        disclosure - users can add skills by simply dropping a `.py` file into the
+        skills directory.
+
+        Example skill module:
+            ```python
+            # my_skill.py
+            def register(registry):
+                registry.register({
+                    "name": "my-skill",
+                    "description": "Does something useful",
+                    "system_prompt": "You are a helpful assistant...",
+                    "tools": []
+                })
+            ```
+
+        Args:
+            directory: Path to the directory containing skill modules.
+            tool_resolver: Optional function to resolve tool names to BaseTool instances.
+
+        Raises:
+            FileNotFoundError: If directory doesn't exist.
+        """
+        import importlib.util
+        import sys
+
+        directory = Path(directory)
+
+        if not directory.exists():
+            raise FileNotFoundError(f"Skills directory not found: {directory}")
+
+        if not directory.is_dir():
+            raise ValueError(f"Path is not a directory: {directory}")
+
+        # Store tool_resolver for use by register() calls
+        self._current_tool_resolver = tool_resolver
+
+        loaded_count = 0
+        for py_file in sorted(directory.glob("*.py")):
+            if py_file.name.startswith("_"):
+                continue  # Skip __init__.py, __pycache__, etc.
+
+            module_name = f"_skill_plugin_{py_file.stem}"
+
+            try:
+                spec = importlib.util.spec_from_file_location(module_name, py_file)
+                if spec is None or spec.loader is None:
+                    logger.warning("Could not load spec for: %s", py_file)
+                    continue
+
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+
+                # Call register() if it exists
+                if hasattr(module, "register") and callable(module.register):
+                    module.register(self)
+                    loaded_count += 1
+                    logger.debug("Loaded skill plugin: %s", py_file.name)
+                else:
+                    logger.warning("No register() function in: %s", py_file.name)
+
+            except Exception as e:
+                logger.exception("Error loading skill plugin %s: %s", py_file.name, e)
+            finally:
+                # Clean up module from sys.modules to avoid conflicts
+                sys.modules.pop(module_name, None)
+
+        self._current_tool_resolver = None
+        logger.info("Loaded %d skill plugins from %s", loaded_count, directory)
+
     def create_invoke_skill_tool(
         self,
         model: BaseChatModel,

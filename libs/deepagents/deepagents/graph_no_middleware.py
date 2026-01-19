@@ -414,6 +414,7 @@ def create_skill_agent(
     system_prompt: str | None = None,
     skills: list[dict[str, Any] | SkillConfig] | None = None,
     skills_config_path: str | Path | None = None,
+    skills_directory: str | Path | None = None,
     root_dir: str | None = None,
     checkpointer: Any | None = None,
     store: Any | None = None,
@@ -436,6 +437,8 @@ def create_skill_agent(
         system_prompt: Custom system prompt to prepend to the base prompt.
         skills: List of skill configurations (dicts or SkillConfig objects).
         skills_config_path: Path to YAML file containing skill definitions.
+        skills_directory: Path to directory containing skill plugin modules (.py files).
+                         Each module should have a register(registry) function.
         root_dir: Root directory for filesystem operations. If None, filesystem
                   tools operate in a limited mode.
         checkpointer: Optional checkpointer for state persistence.
@@ -452,21 +455,27 @@ def create_skill_agent(
         ```python
         from deepagents import create_skill_agent
 
+        # Using skill plugins from directory (progressive disclosure)
         agent = create_skill_agent(
             model="anthropic:claude-sonnet-4-20250514",
-            system_prompt="You are Alpha Cortex, a trading AI.",
+            skills_directory="./skills/",  # Drop .py files here to add skills
+        )
+
+        # Or using inline skill definitions
+        agent = create_skill_agent(
+            model="anthropic:claude-sonnet-4-20250514",
             skills=[
                 {
-                    "name": "market-research",
-                    "description": "Research market conditions",
-                    "system_prompt": "You are a market researcher...",
-                    "tools": [web_search, news_api]
+                    "name": "research",
+                    "description": "Research a topic",
+                    "system_prompt": "You are a researcher...",
+                    "tools": [web_search]
                 }
             ]
         )
 
         result = await agent.ainvoke({
-            "messages": [HumanMessage(content="Analyze AAPL")]
+            "messages": [HumanMessage(content="Research AI trends")]
         })
         ```
     """
@@ -537,6 +546,9 @@ def create_skill_agent(
 
     if skills_config_path:
         skill_registry.load_from_config(skills_config_path)
+
+    if skills_directory:
+        skill_registry.load_from_directory(skills_directory)
 
     # Create invoke_skill tool if skills are registered
     if skill_registry.skills:
@@ -616,95 +628,7 @@ def create_skill_agent(
     return graph.with_config({"recursion_limit": max_iterations * 2})
 
 
-# =============================================================================
-# Convenience Functions
-# =============================================================================
-
-
-def create_trading_agent(
-    model: str | BaseChatModel | None = None,
-    *,
-    market_data_tool: BaseTool | None = None,
-    news_tool: BaseTool | None = None,
-    code_execution_tool: BaseTool | None = None,
-    system_prompt: str | None = None,
-    **kwargs: Any,
-) -> CompiledStateGraph:
-    """Create a trading-focused agent with built-in trading skills.
-
-    This is a convenience function for creating an "Alpha Cortex" style
-    trading agent with pre-configured skills for market research,
-    quantitative analysis, and trade planning.
-
-    Args:
-        model: The language model to use.
-        market_data_tool: Tool for fetching market data.
-        news_tool: Tool for fetching news.
-        code_execution_tool: Tool for executing analysis code.
-        system_prompt: Custom system prompt.
-        **kwargs: Additional arguments passed to create_skill_agent.
-
-    Returns:
-        Configured trading agent.
-    """
-    default_prompt = """You are Alpha Cortex, an advanced AI trading assistant.
-Your role is to help with market analysis, research, and trade planning.
-Always use appropriate skills for specialized tasks."""
-
-    skills = [
-        {
-            "name": "market-research",
-            "description": "Research market conditions, sentiment, and news for trading decisions",
-            "system_prompt": """You are an expert market researcher. Your job is to:
-1. Gather relevant market news and data
-2. Analyze market sentiment
-3. Identify key trends and catalysts
-4. Summarize findings concisely
-
-Provide factual, well-sourced information.""",
-            "tools": [t for t in [news_tool, market_data_tool] if t],
-        },
-        {
-            "name": "quant-analysis",
-            "description": "Perform quantitative analysis including technical indicators and statistics",
-            "system_prompt": """You are a quantitative analyst. Your job is to:
-1. Calculate technical indicators
-2. Analyze price patterns
-3. Run statistical analysis
-4. Generate data visualizations
-
-Use code execution for calculations when available.""",
-            "tools": [t for t in [code_execution_tool, market_data_tool] if t],
-        },
-        {
-            "name": "trade-planning",
-            "description": "Develop trading plans with entry, exit, and risk management",
-            "system_prompt": """You are a trade planner. Your job is to:
-1. Define clear entry criteria
-2. Set stop-loss and take-profit levels
-3. Calculate position sizing based on risk
-4. Document the trading thesis
-
-Always include risk management in your plans.""",
-            "tools": [],
-        },
-    ]
-
-    # Filter out skills with no tools if specific tools weren't provided
-    if not any([market_data_tool, news_tool, code_execution_tool]):
-        # Keep all skills but they'll have limited functionality
-        pass
-
-    return create_skill_agent(
-        model=model,
-        system_prompt=system_prompt or default_prompt,
-        skills=skills,
-        **kwargs,
-    )
-
-
 __all__ = [
     "AgentState",
     "create_skill_agent",
-    "create_trading_agent",
 ]
