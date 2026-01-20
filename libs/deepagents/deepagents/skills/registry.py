@@ -17,7 +17,14 @@ import yaml
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool, StructuredTool
 
-from deepagents.skills.base import Skill, SkillConfig, SimpleSkill, create_skill_from_config
+from deepagents.skills.base import (
+    Skill,
+    SkillConfig,
+    SimpleSkill,
+    WorkflowSkill,
+    WorkflowConfig,
+    create_skill_from_config,
+)
 
 if TYPE_CHECKING:
     pass
@@ -402,13 +409,13 @@ class SkillRegistry:
         if not skills_desc:
             skills_desc = "(No skills registered)"
 
-        description = f"""Invoke a specialized skill to handle a task.
+        description = f"""Invoke a single specialized skill to handle a task.
 
 Available skills:
 {skills_desc}
 
 The skill will execute in an isolated context and return a summary of its work.
-Use this to delegate complex, specialized tasks to the appropriate skill.
+Use this for single-skill tasks. For multi-skill tasks, use invoke_skills_parallel or invoke_skills_sequential instead.
 """
 
         return StructuredTool.from_function(
@@ -417,6 +424,564 @@ Use this to delegate complex, specialized tasks to the appropriate skill.
             name="invoke_skill",
             description=description,
         )
+
+    def create_orchestration_tools(
+        self,
+        model: BaseChatModel,
+        *,
+        additional_context: dict[str, Any] | None = None,
+        max_parallel: int = 5,
+    ) -> list[BaseTool]:
+        """Create all skill invocation tools including orchestration.
+
+        This creates three tools:
+        - invoke_skill: Single skill invocation
+        - invoke_skills_parallel: Run multiple skills concurrently
+        - invoke_skills_sequential: Chain skills with output passing
+
+        Args:
+            model: The language model to use for skill execution.
+            additional_context: Optional context to pass to all skills.
+            max_parallel: Maximum concurrent skill executions.
+
+        Returns:
+            List of skill invocation tools.
+        """
+        import asyncio
+
+        registry = self
+
+        # Single skill invocation (reuse existing)
+        invoke_skill_tool = self.create_invoke_skill_tool(
+            model, additional_context=additional_context
+        )
+
+        # Build skills description for tool docstrings
+        skills_desc = "\n".join(
+            f"- **{s.name}**: {s.description}" for s in self._skills.values()
+        )
+        if not skills_desc:
+            skills_desc = "(No skills registered)"
+
+        # =====================================================================
+        # Parallel Execution Tool
+        # =====================================================================
+
+        def invoke_skills_parallel(
+            invocations: list[dict[str, str]],
+        ) -> str:
+            """Invoke multiple skills in parallel.
+
+            Args:
+                invocations: List of skill invocations, each with:
+                    - skill_name: Name of the skill to invoke
+                    - task: Task description for that skill
+
+            Returns:
+                Combined results from all skills.
+            """
+            if not invocations:
+                return "Error: No skill invocations provided"
+
+            # Validate all skills exist first
+            errors = []
+            for inv in invocations:
+                skill_name = inv.get("skill_name", "")
+                if not registry.get(skill_name):
+                    errors.append(f"Unknown skill: '{skill_name}'")
+            if errors:
+                available = ", ".join(registry._skills.keys())
+                return f"Error: {'; '.join(errors)}. Available: {available}"
+
+            # Execute in parallel using threads
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            results: dict[str, str] = {}
+            with ThreadPoolExecutor(max_workers=min(len(invocations), max_parallel)) as executor:
+                future_to_name = {}
+                for inv in invocations:
+                    skill_name = inv["skill_name"]
+                    task = inv.get("task", "")
+                    skill = registry.get(skill_name)
+                    future = executor.submit(
+                        skill.invoke, task, model, context=additional_context
+                    )
+                    future_to_name[future] = skill_name
+
+                for future in as_completed(future_to_name):
+                    skill_name = future_to_name[future]
+                    try:
+                        results[skill_name] = future.result()
+                    except Exception as e:
+                        logger.exception("Error in parallel skill %s", skill_name)
+                        results[skill_name] = f"Error: {e}"
+
+            # Format results
+            output_parts = []
+            for inv in invocations:  # Preserve original order
+                skill_name = inv["skill_name"]
+                result = results.get(skill_name, "No result")
+                output_parts.append(f"## {skill_name}\n{result}")
+
+            return "\n\n".join(output_parts)
+
+        async def ainvoke_skills_parallel(
+            invocations: list[dict[str, str]],
+        ) -> str:
+            """Invoke multiple skills in parallel (async).
+
+            Args:
+                invocations: List of skill invocations.
+
+            Returns:
+                Combined results from all skills.
+            """
+            if not invocations:
+                return "Error: No skill invocations provided"
+
+            # Validate all skills exist first
+            errors = []
+            for inv in invocations:
+                skill_name = inv.get("skill_name", "")
+                if not registry.get(skill_name):
+                    errors.append(f"Unknown skill: '{skill_name}'")
+            if errors:
+                available = ", ".join(registry._skills.keys())
+                return f"Error: {'; '.join(errors)}. Available: {available}"
+
+            # Execute in parallel using asyncio
+            semaphore = asyncio.Semaphore(max_parallel)
+
+            async def run_skill(skill_name: str, task: str) -> tuple[str, str]:
+                async with semaphore:
+                    skill = registry.get(skill_name)
+                    try:
+                        result = await skill.ainvoke(
+                            task, model, context=additional_context
+                        )
+                        return skill_name, result
+                    except Exception as e:
+                        logger.exception("Error in parallel skill %s", skill_name)
+                        return skill_name, f"Error: {e}"
+
+            tasks = [
+                run_skill(inv["skill_name"], inv.get("task", ""))
+                for inv in invocations
+            ]
+            results_list = await asyncio.gather(*tasks)
+            results = dict(results_list)
+
+            # Format results
+            output_parts = []
+            for inv in invocations:  # Preserve original order
+                skill_name = inv["skill_name"]
+                result = results.get(skill_name, "No result")
+                output_parts.append(f"## {skill_name}\n{result}")
+
+            return "\n\n".join(output_parts)
+
+        parallel_description = f"""Invoke multiple skills in PARALLEL (concurrently).
+
+Use this when:
+- Tasks are INDEPENDENT and don't depend on each other's outputs
+- You want to gather information from multiple sources simultaneously
+- Speed is important and skills can run at the same time
+
+Example: Researching a company from multiple angles simultaneously:
+```json
+[
+  {{"skill_name": "market-research", "task": "Research AAPL market position"}},
+  {{"skill_name": "financial-analysis", "task": "Analyze AAPL financials"}},
+  {{"skill_name": "news-analysis", "task": "Find recent AAPL news"}}
+]
+```
+
+Available skills:
+{skills_desc}
+"""
+
+        parallel_tool = StructuredTool.from_function(
+            func=invoke_skills_parallel,
+            coroutine=ainvoke_skills_parallel,
+            name="invoke_skills_parallel",
+            description=parallel_description,
+        )
+
+        # =====================================================================
+        # Sequential Execution Tool
+        # =====================================================================
+
+        def invoke_skills_sequential(
+            invocations: list[dict[str, str]],
+        ) -> str:
+            """Invoke skills sequentially, passing outputs forward.
+
+            Args:
+                invocations: List of skill invocations in order. Each has:
+                    - skill_name: Name of the skill to invoke
+                    - task: Task description (can reference {{previous_output}})
+
+            Returns:
+                Final result after all skills complete.
+            """
+            if not invocations:
+                return "Error: No skill invocations provided"
+
+            # Validate all skills exist first
+            errors = []
+            for inv in invocations:
+                skill_name = inv.get("skill_name", "")
+                if not registry.get(skill_name):
+                    errors.append(f"Unknown skill: '{skill_name}'")
+            if errors:
+                available = ", ".join(registry._skills.keys())
+                return f"Error: {'; '.join(errors)}. Available: {available}"
+
+            # Execute sequentially
+            previous_output = ""
+            all_outputs: list[tuple[str, str]] = []
+
+            for i, inv in enumerate(invocations):
+                skill_name = inv["skill_name"]
+                task = inv.get("task", "")
+
+                # Inject previous output if referenced
+                if "{{previous_output}}" in task:
+                    task = task.replace("{{previous_output}}", previous_output)
+                elif i > 0 and previous_output:
+                    # Auto-append context from previous skill
+                    task = f"{task}\n\nContext from previous step ({invocations[i-1]['skill_name']}):\n{previous_output}"
+
+                skill = registry.get(skill_name)
+                try:
+                    result = skill.invoke(task, model, context=additional_context)
+                    previous_output = result
+                    all_outputs.append((skill_name, result))
+                except Exception as e:
+                    logger.exception("Error in sequential skill %s", skill_name)
+                    error_msg = f"Error: {e}"
+                    all_outputs.append((skill_name, error_msg))
+                    # Continue with error as context
+                    previous_output = error_msg
+
+            # Format results showing the chain
+            output_parts = []
+            for i, (skill_name, result) in enumerate(all_outputs):
+                step_num = i + 1
+                output_parts.append(f"## Step {step_num}: {skill_name}\n{result}")
+
+            return "\n\n".join(output_parts)
+
+        async def ainvoke_skills_sequential(
+            invocations: list[dict[str, str]],
+        ) -> str:
+            """Invoke skills sequentially (async).
+
+            Args:
+                invocations: List of skill invocations in order.
+
+            Returns:
+                Final result after all skills complete.
+            """
+            if not invocations:
+                return "Error: No skill invocations provided"
+
+            # Validate all skills exist first
+            errors = []
+            for inv in invocations:
+                skill_name = inv.get("skill_name", "")
+                if not registry.get(skill_name):
+                    errors.append(f"Unknown skill: '{skill_name}'")
+            if errors:
+                available = ", ".join(registry._skills.keys())
+                return f"Error: {'; '.join(errors)}. Available: {available}"
+
+            # Execute sequentially
+            previous_output = ""
+            all_outputs: list[tuple[str, str]] = []
+
+            for i, inv in enumerate(invocations):
+                skill_name = inv["skill_name"]
+                task = inv.get("task", "")
+
+                # Inject previous output if referenced
+                if "{{previous_output}}" in task:
+                    task = task.replace("{{previous_output}}", previous_output)
+                elif i > 0 and previous_output:
+                    # Auto-append context from previous skill
+                    task = f"{task}\n\nContext from previous step ({invocations[i-1]['skill_name']}):\n{previous_output}"
+
+                skill = registry.get(skill_name)
+                try:
+                    result = await skill.ainvoke(
+                        task, model, context=additional_context
+                    )
+                    previous_output = result
+                    all_outputs.append((skill_name, result))
+                except Exception as e:
+                    logger.exception("Error in sequential skill %s", skill_name)
+                    error_msg = f"Error: {e}"
+                    all_outputs.append((skill_name, error_msg))
+                    previous_output = error_msg
+
+            # Format results showing the chain
+            output_parts = []
+            for i, (skill_name, result) in enumerate(all_outputs):
+                step_num = i + 1
+                output_parts.append(f"## Step {step_num}: {skill_name}\n{result}")
+
+            return "\n\n".join(output_parts)
+
+        sequential_description = f"""Invoke skills SEQUENTIALLY, passing each output to the next.
+
+Use this when:
+- Tasks DEPEND on each other's outputs
+- You need a pipeline/chain of processing
+- Later steps need results from earlier steps
+
+The output from each skill is automatically passed to the next. You can explicitly
+reference it with {{{{previous_output}}}} in the task description.
+
+Example: Research then analyze then summarize:
+```json
+[
+  {{"skill_name": "market-research", "task": "Research AAPL competitors"}},
+  {{"skill_name": "financial-analysis", "task": "Compare AAPL financials against competitors found"}},
+  {{"skill_name": "report-writer", "task": "Write executive summary of the analysis"}}
+]
+```
+
+Available skills:
+{skills_desc}
+"""
+
+        sequential_tool = StructuredTool.from_function(
+            func=invoke_skills_sequential,
+            coroutine=ainvoke_skills_sequential,
+            name="invoke_skills_sequential",
+            description=sequential_description,
+        )
+
+        return [invoke_skill_tool, parallel_tool, sequential_tool]
+
+    def create_skill_discovery_tool(
+        self,
+        model: BaseChatModel,
+        *,
+        additional_context: dict[str, Any] | None = None,
+    ) -> BaseTool:
+        """Create a single skill discovery and activation tool.
+
+        This tool implements the progressive disclosure pattern:
+        1. Main agent describes what it needs to accomplish
+        2. The tool discovers the best matching skill
+        3. The skill is activated and executed
+        4. Only the final result is returned to the main agent
+
+        This is the preferred pattern for skill invocation - the main agent
+        doesn't need to know about specific skills, just describe the task.
+
+        Args:
+            model: The language model to use for skill execution.
+            additional_context: Optional context to pass to skills.
+
+        Returns:
+            A StructuredTool that discovers and activates the appropriate skill.
+        """
+        registry = self
+
+        def activate_skill(task: str) -> str:
+            """Activate the most appropriate skill to handle a task.
+
+            This tool automatically discovers which skill is best suited for
+            the given task based on skill descriptions and activates it.
+            You don't need to specify the skill name - just describe what
+            you need accomplished.
+
+            Args:
+                task: Detailed description of what you want to accomplish.
+
+            Returns:
+                Result from the activated skill.
+            """
+            # Find the best matching skill
+            skill, confidence = registry._discover_skill(task, model)
+
+            if not skill:
+                available = ", ".join(registry._skills.keys())
+                return f"No suitable skill found for task. Available skills: {available}"
+
+            logger.info(
+                "Discovered skill '%s' (confidence: %.2f) for task: %s",
+                skill.name, confidence, task[:100]
+            )
+
+            try:
+                result = skill.invoke(task, model, context=additional_context)
+                return result
+            except Exception as e:
+                logger.exception("Error invoking skill %s", skill.name)
+                return f"Error executing skill '{skill.name}': {e}"
+
+        async def aactivate_skill(task: str) -> str:
+            """Activate the most appropriate skill asynchronously.
+
+            Args:
+                task: Detailed description of what you want to accomplish.
+
+            Returns:
+                Result from the activated skill.
+            """
+            # Find the best matching skill
+            skill, confidence = registry._discover_skill(task, model)
+
+            if not skill:
+                available = ", ".join(registry._skills.keys())
+                return f"No suitable skill found for task. Available skills: {available}"
+
+            logger.info(
+                "Discovered skill '%s' (confidence: %.2f) for task: %s",
+                skill.name, confidence, task[:100]
+            )
+
+            try:
+                result = await skill.ainvoke(task, model, context=additional_context)
+                return result
+            except Exception as e:
+                logger.exception("Error invoking skill %s", skill.name)
+                return f"Error executing skill '{skill.name}': {e}"
+
+        # Build skill catalog for description
+        skills_catalog = "\n".join(
+            f"- **{s.name}**: {s.description}" for s in self._skills.values()
+        )
+        if not skills_catalog:
+            skills_catalog = "(No skills registered)"
+
+        description = f"""Activate the most appropriate skill to handle a task.
+
+This tool automatically discovers and activates the best skill for your task.
+Just describe what you need - the system handles skill selection.
+
+Available skill capabilities:
+{skills_catalog}
+
+Example: "Research and analyze AAPL stock performance" will automatically
+activate a research or analysis skill if available.
+"""
+
+        return StructuredTool.from_function(
+            func=activate_skill,
+            coroutine=aactivate_skill,
+            name="activate_skill",
+            description=description,
+        )
+
+    def _discover_skill(
+        self,
+        task: str,
+        model: BaseChatModel,
+    ) -> tuple[Skill | None, float]:
+        """Discover the best matching skill for a task.
+
+        Uses semantic matching between the task description and skill
+        descriptions to find the most appropriate skill.
+
+        Args:
+            task: The task description.
+            model: Language model for semantic matching.
+
+        Returns:
+            Tuple of (best_skill, confidence_score). Returns (None, 0.0) if
+            no suitable skill is found.
+        """
+        if not self._skills:
+            return None, 0.0
+
+        # For a single skill, just return it
+        if len(self._skills) == 1:
+            skill = list(self._skills.values())[0]
+            return skill, 1.0
+
+        # Use the model to select the best skill
+        skills_info = "\n".join(
+            f"{i+1}. {s.name}: {s.description}"
+            for i, s in enumerate(self._skills.values())
+        )
+
+        selection_prompt = f"""Given the following task, select the most appropriate skill to handle it.
+
+Task: {task}
+
+Available skills:
+{skills_info}
+
+Respond with ONLY the skill name (e.g., "market-research") that best matches the task.
+If no skill is a good match, respond with "NONE".
+"""
+
+        try:
+            from langchain_core.messages import HumanMessage
+
+            response = model.invoke([HumanMessage(content=selection_prompt)])
+            selected_name = str(response.content).strip().lower()
+
+            # Clean up the response
+            selected_name = selected_name.replace('"', '').replace("'", "")
+
+            if selected_name == "none":
+                return None, 0.0
+
+            # Find the skill by name (case-insensitive)
+            for name, skill in self._skills.items():
+                if name.lower() == selected_name:
+                    return skill, 0.9  # High confidence from model selection
+
+            # Fuzzy match - check if response contains a skill name
+            for name, skill in self._skills.items():
+                if name.lower() in selected_name:
+                    return skill, 0.7
+
+            # Fall back to first skill if nothing matched
+            logger.warning(
+                "Model returned '%s' but no matching skill found. "
+                "Falling back to first skill.",
+                selected_name
+            )
+            return list(self._skills.values())[0], 0.3
+
+        except Exception as e:
+            logger.exception("Error in skill discovery")
+            # Fall back to first skill
+            return list(self._skills.values())[0], 0.2
+
+    def register_workflow_skill(
+        self,
+        config: dict[str, Any],
+        tool_registry: dict[str, BaseTool] | None = None,
+    ) -> None:
+        """Register a workflow-based skill from configuration.
+
+        Args:
+            config: Skill configuration with 'workflow' key.
+            tool_registry: Tool registry for resolving tool names.
+
+        Example config:
+            ```yaml
+            name: stock-analyzer
+            description: Analyze stocks comprehensively
+            workflow:
+              - tools: market_data
+                task_template: "Get data for {{input}}"
+              - tools: [technical_analysis, sentiment_analysis]
+              - tools: report_generator
+            ```
+        """
+        if "workflow" not in config:
+            raise ValueError("Workflow skill config must have 'workflow' key")
+
+        skill = WorkflowSkill.from_config(config, tool_registry)
+        self.register(skill)
 
 
 def load_skills_from_yaml(

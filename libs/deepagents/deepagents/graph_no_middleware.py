@@ -30,7 +30,7 @@ from langgraph.graph.message import add_messages
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
-from deepagents.skills import SkillConfig, SkillRegistry, SimpleSkill
+from deepagents.skills import SkillConfig, SkillRegistry, SimpleSkill, WorkflowSkill
 
 logger = logging.getLogger(__name__)
 
@@ -386,19 +386,77 @@ You have access to filesystem tools:
 4. Provide clear, concise responses
 """
 
-SKILLS_SECTION_TEMPLATE = """You have access to specialized skills via the `invoke_skill` tool:
+SKILLS_SECTION_TEMPLATE = """You have access to specialized skills that can be invoked as subagents:
 
 {skills_list}
 
-When to use skills:
-- When a task matches a skill's domain expertise
-- When you need specialized knowledge or workflows
-- When isolating a complex subtask would be beneficial
+### Skill Activation
 
-Usage:
+Use **activate_skill** to delegate tasks to the appropriate skill:
 ```
-invoke_skill(skill_name="skill-name", task="detailed task description")
+activate_skill(task="Your detailed task description")
 ```
+
+The system automatically discovers and activates the best skill for your task.
+You don't need to specify which skill - just describe what you need accomplished.
+
+Example:
+- "Research and analyze AAPL stock performance" → Activates research/analysis skill
+- "Generate a quarterly report from the data" → Activates report generation skill
+
+### When to Use Skills
+
+Delegate to skills when:
+- The task requires specialized domain knowledge
+- The task involves multiple steps (research → analyze → synthesize)
+- The task would benefit from isolated, focused execution
+
+Handle directly when:
+- Simple file operations or quick lookups
+- Tasks that need direct user interaction
+- Quick calculations or formatting
+"""
+
+# Alternative template for explicit skill control (backwards compatibility)
+SKILLS_EXPLICIT_TEMPLATE = """You have access to specialized skills that can be invoked as subagents:
+
+{skills_list}
+
+### Skill Orchestration Tools
+
+You have THREE ways to invoke skills - choose based on the task:
+
+1. **invoke_skill** - Single skill invocation
+   ```
+   invoke_skill(skill_name="research", task="Research topic X")
+   ```
+   Use for: Simple single-skill tasks
+
+2. **invoke_skills_parallel** - Run multiple skills CONCURRENTLY
+   ```
+   invoke_skills_parallel(invocations=[
+     {{"skill_name": "research", "task": "Research X"}},
+     {{"skill_name": "analysis", "task": "Analyze Y"}}
+   ])
+   ```
+   Use for: Independent tasks that don't depend on each other's outputs.
+
+3. **invoke_skills_sequential** - Run skills in a CHAIN (output flows forward)
+   ```
+   invoke_skills_sequential(invocations=[
+     {{"skill_name": "research", "task": "Research X"}},
+     {{"skill_name": "analysis", "task": "Analyze the research findings"}},
+     {{"skill_name": "writer", "task": "Write a summary report"}}
+   ])
+   ```
+   Use for: Pipeline tasks where later skills need earlier results.
+
+### Decision Guide
+
+Ask yourself:
+- "Can these skills run at the same time?" → Use PARALLEL
+- "Does skill B need output from skill A?" → Use SEQUENTIAL
+- "Is it just one skill?" → Use invoke_skill
 """
 
 
@@ -415,11 +473,13 @@ def create_skill_agent(
     skills: list[dict[str, Any] | SkillConfig] | None = None,
     skills_config_path: str | Path | None = None,
     skills_directory: str | Path | None = None,
+    tool_registry: dict[str, BaseTool] | None = None,
     root_dir: str | None = None,
     checkpointer: Any | None = None,
     store: Any | None = None,
     include_planning_tools: bool = True,
     include_filesystem_tools: bool = True,
+    use_skill_discovery: bool = True,
     max_iterations: int = 100,
     debug: bool = False,
 ) -> CompiledStateGraph:
@@ -430,21 +490,36 @@ def create_skill_agent(
     - Interact with the filesystem
     - Invoke specialized skills for domain-specific tasks
 
+    **Single Skill Activation (Progressive Disclosure)**:
+    By default (`use_skill_discovery=True`), the agent uses a single `activate_skill`
+    tool that automatically discovers and activates the appropriate skill based on
+    the task description. The main agent doesn't need to know specific skill names.
+
+    **Workflow Skills**:
+    Skills can define workflows that orchestrate multiple tools via subagents.
+    Each workflow step can run one tool (serial) or multiple tools (parallel).
+
     Args:
         model: The language model to use. Can be a string like "anthropic:claude-sonnet-4-20250514"
                or a BaseChatModel instance. Defaults to Claude Sonnet.
         tools: Additional tools for the agent.
         system_prompt: Custom system prompt to prepend to the base prompt.
         skills: List of skill configurations (dicts or SkillConfig objects).
+               For workflow skills, include a 'workflow' key with step definitions.
         skills_config_path: Path to YAML file containing skill definitions.
         skills_directory: Path to directory containing skill plugin modules (.py files).
                          Each module should have a register(registry) function.
+        tool_registry: Registry mapping tool names to BaseTool instances.
+                      Used for resolving tool references in workflow skills.
         root_dir: Root directory for filesystem operations. If None, filesystem
                   tools operate in a limited mode.
         checkpointer: Optional checkpointer for state persistence.
         store: Optional store for persistent storage.
         include_planning_tools: Whether to include todo list tools.
         include_filesystem_tools: Whether to include filesystem tools.
+        use_skill_discovery: If True (default), use single `activate_skill` tool
+                            with automatic skill discovery. If False, use explicit
+                            `invoke_skill`, `invoke_skills_parallel`, `invoke_skills_sequential`.
         max_iterations: Maximum agent iterations before stopping.
         debug: Enable debug logging.
 
@@ -455,27 +530,43 @@ def create_skill_agent(
         ```python
         from deepagents import create_skill_agent
 
-        # Using skill plugins from directory (progressive disclosure)
-        agent = create_skill_agent(
-            model="anthropic:claude-sonnet-4-20250514",
-            skills_directory="./skills/",  # Drop .py files here to add skills
-        )
-
-        # Or using inline skill definitions
+        # Simple skill with progressive disclosure
         agent = create_skill_agent(
             model="anthropic:claude-sonnet-4-20250514",
             skills=[
                 {
                     "name": "research",
-                    "description": "Research a topic",
+                    "description": "Research a topic in depth",
                     "system_prompt": "You are a researcher...",
                     "tools": [web_search]
                 }
             ]
         )
 
+        # Workflow skill with subagent orchestration
+        agent = create_skill_agent(
+            skills=[
+                {
+                    "name": "stock-analyzer",
+                    "description": "Analyze stocks comprehensively",
+                    "workflow": [
+                        {"tools": "market_data", "task_template": "Get data for {{input}}"},
+                        {"tools": ["technical", "sentiment"]},  # parallel
+                        {"tools": "report_generator"},
+                    ],
+                }
+            ],
+            tool_registry={
+                "market_data": market_data_tool,
+                "technical": technical_tool,
+                "sentiment": sentiment_tool,
+                "report_generator": report_tool,
+            }
+        )
+
+        # Main agent describes task - skill is auto-discovered
         result = await agent.ainvoke({
-            "messages": [HumanMessage(content="Research AI trends")]
+            "messages": [HumanMessage(content="Analyze AAPL stock")]
         })
         ```
     """
@@ -542,7 +633,11 @@ def create_skill_agent(
 
     if skills:
         for skill_config in skills:
-            skill_registry.register(skill_config)
+            if isinstance(skill_config, dict) and "workflow" in skill_config:
+                # Workflow skill - register with tool registry
+                skill_registry.register_workflow_skill(skill_config, tool_registry)
+            else:
+                skill_registry.register(skill_config)
 
     if skills_config_path:
         skill_registry.load_from_config(skills_config_path)
@@ -550,10 +645,16 @@ def create_skill_agent(
     if skills_directory:
         skill_registry.load_from_directory(skills_directory)
 
-    # Create invoke_skill tool if skills are registered
+    # Create skill tools if skills are registered
     if skill_registry.skills:
-        invoke_skill_tool = skill_registry.create_invoke_skill_tool(model)
-        all_tools.append(invoke_skill_tool)
+        if use_skill_discovery:
+            # Single skill activation (progressive disclosure)
+            discovery_tool = skill_registry.create_skill_discovery_tool(model)
+            all_tools.append(discovery_tool)
+        else:
+            # Explicit skill orchestration (backwards compatibility)
+            orchestration_tools = skill_registry.create_orchestration_tools(model)
+            all_tools.extend(orchestration_tools)
 
     # Build system prompt
     if skill_registry.skills:
@@ -561,7 +662,10 @@ def create_skill_agent(
             f"- **{s['name']}**: {s['description']}"
             for s in skill_registry.list_skills()
         )
-        skills_section = SKILLS_SECTION_TEMPLATE.format(skills_list=skills_list)
+        if use_skill_discovery:
+            skills_section = SKILLS_SECTION_TEMPLATE.format(skills_list=skills_list)
+        else:
+            skills_section = SKILLS_EXPLICIT_TEMPLATE.format(skills_list=skills_list)
     else:
         skills_section = "(No skills configured)"
 
